@@ -261,7 +261,7 @@ async function operator(proxies = []) {
     const start = await $.http.post({
       url: "http://127.0.0.1:9876/start",
       headers: { "content-type": "application/json" },
-      timeout,
+      timeout: Math.max(timeout, 20000),
       body: JSON.stringify({ proxies: missInternal, timeout: 3000 + missInternal.length * 9000 }),
     });
     const sb = safeJson(start.body, null);
@@ -272,41 +272,65 @@ async function operator(proxies = []) {
     const ipLimiter = createRateLimiter(ipRpm, Math.max(4, concurrency));
     const rirLimiter = createRateLimiter(rirRpm, 6);
 
+    // 同一服务器只探测一次：同 host 多端口节点直接复用本次运行结果，大幅减少首次探测耗时
+    const hostCache = new Map();   // server -> meta
+    const hostPending = new Map(); // server -> Promise（并发去重）
+
     const results = await mapLimit(missInternal, concurrency, async (node, k) => {
       const proxyUrl = `http://127.0.0.1:${sb.ports[k]}`;
       const ck = cacheKey(node);
+      const host = String(node?.server || "");
 
-      try {
-        let d;
-        try {
-          d = await fetchEcho($, proxyUrl, timeout, retries, ipLimiter);
-        } catch {
-          const w = await fetchIpWhoIs($, proxyUrl, timeout, retries);
-          if (!w?.success) throw new Error("ip-api and ipwho.is failed");
-          d = {
-            status: "success",
-            query: w.ip || "",
-            countryCode: w.country_code || "",
-            as: (w.connection?.asn ? `AS${w.connection.asn}` : "") + " " + (w.connection?.org || ""),
-            isp: w.connection?.isp || w.connection?.org || "",
-            org: w.connection?.org || "",
-            hosting: /(hosting|datacenter)/i.test(JSON.stringify(w)) ? true : false,
-            mobile: /(mobile|cellular)/i.test(JSON.stringify(w)) ? true : false,
-            _whois: w,
-          };
-        }
-
-        const ip = d.query || "";
-        const cc = String(d.countryCode || "").trim().toUpperCase();
-        const rirCC = await getRirCC($, ip, d._whois, cacheAll, ttlMs, timeout, rirLimiter);
-        const m = { flag: flagEmoji(cc), cc, type: ipType(d), native: nativeLabel(cc, rirCC) };
-        if (ip) cacheAll[ck] = { ts: now(), ...m };
-        return m;
-      } catch {
-        // 失败结果不缓存，下次运行重新检测
-        if (!markFail) return null;
-        return { flag: "", cc: "", type: "未知", native: "未知" };
+      if (host) {
+        if (hostCache.has(host)) return hostCache.get(host);
+        if (hostPending.has(host)) return hostPending.get(host);
       }
+
+      const task = (async () => {
+        try {
+          let d;
+          try {
+            d = await fetchEcho($, proxyUrl, timeout, retries, ipLimiter);
+          } catch {
+            const w = await fetchIpWhoIs($, proxyUrl, timeout, retries);
+            if (!w?.success) throw new Error("ip-api and ipwho.is failed");
+            d = {
+              status: "success",
+              query: w.ip || "",
+              countryCode: w.country_code || "",
+              as: (w.connection?.asn ? `AS${w.connection.asn}` : "") + " " + (w.connection?.org || ""),
+              isp: w.connection?.isp || w.connection?.org || "",
+              org: w.connection?.org || "",
+              hosting: /(hosting|datacenter)/i.test(JSON.stringify(w)) ? true : false,
+              mobile: /(mobile|cellular)/i.test(JSON.stringify(w)) ? true : false,
+              _whois: w,
+            };
+          }
+
+          const ip = d.query || "";
+          const cc = String(d.countryCode || "").trim().toUpperCase();
+          const rirCC = await getRirCC($, ip, d._whois, cacheAll, ttlMs, timeout, rirLimiter);
+          const m = { flag: flagEmoji(cc), cc, type: ipType(d), native: nativeLabel(cc, rirCC) };
+          if (ip) cacheAll[ck] = { ts: now(), ...m };
+          return m;
+        } catch {
+          // 失败结果不缓存，下次运行重新检测
+          if (!markFail) return null;
+          return { flag: "", cc: "", type: "未知", native: "未知" };
+        }
+      })();
+
+      if (host) {
+        hostPending.set(host, task);
+        try {
+          const r = await task;
+          hostCache.set(host, r);
+          return r;
+        } finally {
+          hostPending.delete(host);
+        }
+      }
+      return task;
     });
 
     for (let k = 0; k < missIdx.length; k++) meta[missIdx[k]] = results[k];
