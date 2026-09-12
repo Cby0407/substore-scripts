@@ -145,6 +145,10 @@ async function operator(proxies = []) {
 
   if (!proxies || !proxies.length) return proxies;
 
+  const t0 = Date.now();
+  const log = (...a) => { try { console.log("[landing-flag-v5]", ...a, `+${Date.now() - t0}ms`); } catch {} };
+  log("BEGIN nodes=", proxies.length);
+
   const cacheAll = safeJson($.read(CACHE_KEY) || "{}", {});
   const ttlMs = hrs(ttl);
   pruneCache(cacheAll, ttlMs);
@@ -176,19 +180,31 @@ async function operator(proxies = []) {
       missIdx.push(i);
     }
   }
+  log("internal ok, miss=", missIdx.length);
 
   // 全部命中缓存：无需启动代理测试，直接进入编号排序
   if (missIdx.length) {
     const missInternal = missIdx.map(i => internal[i]);
 
-    const start = await $.http.post({
-      url: "http://127.0.0.1:9876/start",
-      headers: { "content-type": "application/json" },
-      timeout: Math.max(timeout, 20000),
-      body: JSON.stringify({ proxies: missInternal, timeout: 3000 + missInternal.length * 9000 }),
-    });
+    log("POST /9876/start ...");
+    let start;
+    try {
+      start = await $.http.post({
+        url: "http://127.0.0.1:9876/start",
+        headers: { "content-type": "application/json" },
+        timeout: Math.max(timeout, 20000),
+        body: JSON.stringify({ proxies: missInternal, timeout: 3000 + missInternal.length * 9000 }),
+      });
+    } catch (e) {
+      log("start EXCEPTION:", String(e?.message || e).slice(0, 200));
+      return proxies;
+    }
+    log("start returned, status=", start?.statusCode, "bodyLen=", String(start?.body || "").length);
     const sb = safeJson(start.body, null);
-    if (!sb?.pid || !Array.isArray(sb?.ports) || sb.ports.length !== missInternal.length) return proxies;
+    if (!sb?.pid || !Array.isArray(sb?.ports) || sb.ports.length !== missInternal.length) {
+      log("start bad response, return proxies unchanged");
+      return proxies;
+    }
 
     await $.wait(1200);
 
@@ -251,6 +267,7 @@ async function operator(proxies = []) {
     });
 
     for (let k = 0; k < missIdx.length; k++) meta[missIdx[k]] = results[k];
+    log("probe done, ok=", meta.filter(Boolean).length, "of", missIdx.length);
 
     try {
       await $.http.post({
@@ -259,10 +276,12 @@ async function operator(proxies = []) {
         timeout,
         body: JSON.stringify({ pid: [sb.pid] }),
       });
-    } catch {}
+      log("stop ok");
+    } catch (e) { log("stop err:", String(e?.message || e).slice(0, 120)); }
   }
 
   $.write(JSON.stringify(cacheAll), CACHE_KEY);
+  log("cache written");
 
   // —— 分组编号 + 排序（序号与批次相关，永远现算，不依赖缓存）——
   const valid = [];
@@ -306,6 +325,7 @@ async function operator(proxies = []) {
       }
       renamed.push(p);
     }
+    log("DONE renamed=", valid.length, "invalid=", invalid.length);
     return renamed;
   } else {
     // 不排序：保持原顺序，组内仍按 US01、US02… 编号
