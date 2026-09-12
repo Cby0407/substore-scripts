@@ -68,6 +68,39 @@ function cacheKey(node) {
   return `tag:${String(node?.server || "")}:${String(node?.port ?? "")}`;
 }
 
+// 节点字段清洗：mihomo 必需字段缺失会直接启动失败（如 vmess 缺 alterId/cipher）
+// 可补默认值的补上；关键字段缺失的返回 false（剔除，不拖垮整个配置）
+function isUsableNode(n) {
+  if (!n || !n.server || !n.port) return false;
+  const t = String(n.type || "").toLowerCase();
+  switch (t) {
+    case "vmess":
+    case "vless":
+      if (!n.uuid) return false;
+      if (n.alterId === undefined || n.alterId === null) n.alterId = 0;
+      if (!n.cipher) n.cipher = "auto";
+      return true;
+    case "ss":
+      return !!(n.method && n.password);
+    case "trojan":
+      if (!n.password) return false;
+      if (!n.sni) n.sni = n.server;
+      return true;
+    case "ssr":
+      return !!(n.password && n.cipher && n.protocol && n.obfs);
+    case "hysteria2":
+    case "hy2":
+      return !!n.password;
+    case "tuic":
+      return !!(n.password || n.uuid);
+    case "wireguard":
+    case "wg":
+      return !!n.privateKey;
+    default:
+      return true;
+  }
+}
+
 // 简单令牌桶限速器；rpm<=0 表示不限速（用 setTimeout 等待，不依赖 Sub-Store 注入的 API 对象）
 function createRateLimiter(rpm, burst) {
   if (!(rpm > 0)) return async function () {};
@@ -186,38 +219,48 @@ async function operator(proxies = []) {
   if (missIdx.length) {
     const missInternal = missIdx.map(i => internal[i]);
 
-    log("POST /9876/start ...");
-    let start;
-    try {
-      start = await $.http.post({
-        url: "http://127.0.0.1:9876/start",
-        headers: { "content-type": "application/json" },
-        timeout: Math.max(timeout, 20000),
-        body: JSON.stringify({ proxies: missInternal, timeout: 3000 + missInternal.length * 9000 }),
-      });
-    } catch (e) {
-      log("start EXCEPTION:", String(e?.message || e).slice(0, 200));
-      return proxies;
+    // —— 节点字段清洗：缺 mihomo 必需字段的节点剔除（否则 mihomo 整体启动失败）——
+    const badPos = new Set();
+    const okPos = [];
+    for (let k = 0; k < missInternal.length; k++) {
+      if (isUsableNode(missInternal[k])) okPos.push(k); else badPos.add(k);
     }
-    log("start returned, status=", start?.statusCode, "bodyLen=", String(start?.body || "").length);
-    const sb = safeJson(start.body, null);
-    if (!sb?.pid || !Array.isArray(sb?.ports) || sb.ports.length !== missInternal.length) {
-      log("start bad response, return proxies unchanged");
-      return proxies;
-    }
+    if (badPos.size) log("sanitize: drop", badPos.size, "bad nodes");
+    const okInternal = okPos.map(k => missInternal[k]);
 
-    await $.wait(1200);
+    if (okInternal.length) {
+      log("POST /9876/start ...");
+      let start;
+      try {
+        start = await $.http.post({
+          url: "http://127.0.0.1:9876/start",
+          headers: { "content-type": "application/json" },
+          timeout: Math.max(timeout, 20000),
+          body: JSON.stringify({ proxies: okInternal, timeout: 3000 + okInternal.length * 9000 }),
+        });
+      } catch (e) {
+        log("start EXCEPTION:", String(e?.message || e).slice(0, 200));
+        return proxies;
+      }
+      log("start returned, status=", start?.statusCode, "bodyLen=", String(start?.body || "").length);
+      const sb = safeJson(start.body, null);
+      if (!sb?.pid || !Array.isArray(sb?.ports) || sb.ports.length !== okInternal.length) {
+        log("start bad response, return proxies unchanged");
+        return proxies;
+      }
 
-    const limiter = createRateLimiter(rpm, Math.max(4, concurrency));
+      await $.wait(1200);
 
-    // 同一服务器只探测一次：同 host 多端口节点直接复用本次运行结果
-    const hostCache = new Map();   // server -> meta
-    const hostPending = new Map(); // server -> Promise（并发去重）
+      const limiter = createRateLimiter(rpm, Math.max(4, concurrency));
 
-    const results = await mapLimit(missInternal, concurrency, async (node, k) => {
-      const proxyUrl = `http://127.0.0.1:${sb.ports[k]}`;
-      const ck = cacheKey(node);
-      const host = String(node?.server || "");
+      // 同一服务器只探测一次：同 host 多端口节点直接复用本次运行结果
+      const hostCache = new Map();   // server -> meta
+      const hostPending = new Map(); // server -> Promise（并发去重）
+
+      const results = await mapLimit(okInternal, concurrency, async (node, k) => {
+        const proxyUrl = `http://127.0.0.1:${sb.ports[k]}`;
+        const ck = cacheKey(node);
+        const host = String(node?.server || "");
 
       if (host) {
         if (hostCache.has(host)) return hostCache.get(host);
@@ -266,7 +309,7 @@ async function operator(proxies = []) {
       return task;
     });
 
-    for (let k = 0; k < missIdx.length; k++) meta[missIdx[k]] = results[k];
+    for (let k = 0; k < okPos.length; k++) meta[missIdx[okPos[k]]] = results[k];
     log("probe done, ok=", meta.filter(Boolean).length, "of", missIdx.length);
 
     try {
@@ -278,6 +321,7 @@ async function operator(proxies = []) {
       });
       log("stop ok");
     } catch (e) { log("stop err:", String(e?.message || e).slice(0, 120)); }
+    }
   }
 
   $.write(JSON.stringify(cacheAll), CACHE_KEY);
