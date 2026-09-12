@@ -180,7 +180,11 @@ async function operator(proxies = []) {
 
   const t0 = Date.now();
   const log = (...a) => { try { console.log("[landing-flag-v5]", ...a, `+${Date.now() - t0}ms`); } catch {} };
-  log("BEGIN nodes=", proxies.length);
+  // 存储打点：Sub-Store 吞 console.log，改用 $.write 写数据存储，可在服务器数据文件里直接读
+  const dbg = (step, extra) => {
+    try { $.write(JSON.stringify({ step, ts: Date.now(), ms: Date.now() - t0, ...(extra || {}) }), "dbg_v5"); } catch {}
+  };
+  dbg("BEGIN", { nodes: proxies.length });
 
   const cacheAll = safeJson($.read(CACHE_KEY) || "{}", {});
   const ttlMs = hrs(ttl);
@@ -214,6 +218,7 @@ async function operator(proxies = []) {
     }
   }
   log("internal ok, miss=", missIdx.length);
+  dbg("INTERNAL", { miss: missIdx.length });
 
   // 全部命中缓存：无需启动代理测试，直接进入编号排序
   if (missIdx.length) {
@@ -227,9 +232,11 @@ async function operator(proxies = []) {
     }
     if (badPos.size) log("sanitize: drop", badPos.size, "bad nodes");
     const okInternal = okPos.map(k => missInternal[k]);
+    dbg("SANITIZE", { drop: badPos.size, ok: okInternal.length });
 
     if (okInternal.length) {
       log("POST /9876/start ...");
+      dbg("STARTING", { n: okInternal.length });
       let start;
       try {
         start = await $.http.post({
@@ -246,8 +253,10 @@ async function operator(proxies = []) {
       const sb = safeJson(start.body, null);
       if (!sb?.pid || !Array.isArray(sb?.ports) || sb.ports.length !== okInternal.length) {
         log("start bad response, return proxies unchanged");
+        dbg("START_BAD", { status: start?.statusCode, body: String(start?.body || "").slice(0, 120) });
         return proxies;
       }
+      dbg("START_OK", { ports: sb.ports.length });
 
       await $.wait(1200);
 
@@ -311,6 +320,7 @@ async function operator(proxies = []) {
 
     for (let k = 0; k < okPos.length; k++) meta[missIdx[okPos[k]]] = results[k];
     log("probe done, ok=", meta.filter(Boolean).length, "of", missIdx.length);
+    dbg("PROBE_DONE", { ok: meta.filter(Boolean).length, miss: missIdx.length });
 
     try {
       await $.http.post({
@@ -370,6 +380,7 @@ async function operator(proxies = []) {
       renamed.push(p);
     }
     log("DONE renamed=", valid.length, "invalid=", invalid.length);
+    dbg("DONE", { renamed: valid.length, invalid: invalid.length });
     return renamed;
   } else {
     // 不排序：保持原顺序，组内仍按 US01、US02… 编号
