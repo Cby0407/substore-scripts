@@ -258,7 +258,8 @@ async function operator(proxies = []) {
       }
       dbg("START_OK", { ports: sb.ports.length });
 
-      await $.wait(1200);
+      // mihomo 启动监听需要 3-4 秒，等待足够时间再探测（曾因等 1.2s 不够导致全部连接被拒）
+      await $.wait(4000);
 
       const limiter = createRateLimiter(rpm, Math.max(4, concurrency));
 
