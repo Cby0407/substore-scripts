@@ -70,19 +70,20 @@ function cacheKey(node) {
   return `tag:${String(node?.server || "")}:${String(node?.port ?? "")}`;
 }
 
-// 简单令牌桶限速器；rpm<=0 表示不限速
+// 简单令牌桶限速器；rpm<=0 表示不限速（用 setTimeout 等待，不依赖 Sub-Store 注入的 API 对象）
 function createRateLimiter(rpm, burst) {
   if (!(rpm > 0)) return async function () {};
   const interval = 60000 / rpm;
   let tokens = Math.max(1, burst);
   let last = now();
+  const wait = (ms) => new Promise((r) => setTimeout(r, ms));
   return async function acquire() {
     for (;;) {
       const t = now();
       tokens = Math.min(Math.max(1, burst), tokens + (t - last) / interval);
       last = t;
       if (tokens >= 1) { tokens -= 1; return; }
-      await $.wait(Math.ceil((1 - tokens) * interval) + 20);
+      await wait(Math.ceil((1 - tokens) * interval) + 20);
       last = now();
     }
   };
